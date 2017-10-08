@@ -17,19 +17,91 @@
 #include <Wire.h>
 #include <EEPROM.h>
 #include <time.h>
+#include <TimeLib.h>
+#include <WiFiUdp.h>
+#include <Timezone.h>
+#include <ArduinoJson.h>
+
+
+// For OLED display
+#include "icons.h"
+#include "fonts.h"
+#define I2C_DISPLAY_ADDRESS 0x3c
+#define OLED_SSD1306
+#if defined (OLED_SSD1306)
+#include <SSD1306Wire.h>
+#include <OLEDDisplayUi.h>
+#endif
+// Number of line to display for devices and Wifi
+#define I2C_DISPLAY_DEVICE  4
+#define WIFI_DISPLAY_NET    4
+#define SDA_PIN D2
+#define SDC_PIN D1
 
 // For proximity detection
 #define PROXIMITY D5    // Input for proximity detector
-#define PROXIMITY_TIMEOUT   3*60*1000  // Period of time in minutes without proximity detection before blanking tubes
+#define PROXIMITY_TIMEOUT   3*60*1000      // Period of time in minutes without proximity detection before blanking tubes
 #define EEPROM_PROXIMITY 353          // EEPROM memory location for proximity config
 boolean proximityStatus = true;   
 unsigned long lastproximityTime;      // Timestamp of high to low transition of proximity sensor
 
+
+#ifdef OLED_SSD1306
+SSD1306Wire  display(I2C_DISPLAY_ADDRESS, SDA_PIN, SDC_PIN);
+#endif
+OLEDDisplayUi ui( &display );
+
   
-#define SOFTWARE_VERSION "1.0.6"
+#define USE_NTP                         // Use NTP Protocol to fetch time  
+#define NTP_POOL_URL "pool.ntp.org"     // URL to find NTP server use pool.ntp.org for worldwide servers
+#define LONGUPDATE 1*60*60*1000         // Long period between time updates once per hour
+#define SHORTUPDATE 60*1000             // Short period between time updates, once per minute
+#define WEATHER_SERVER_URL "http://datapoint.metoffice.gov.uk/public/data/val/wxfcs/all/json/"
+#define WEATHER_LOCATION_ID 352546      //Marlow Bucks
+#define WEATHER_API_KEY "====My Met Office API Key===="   
+unsigned long lastWeatherUpdateTime;    // time of  last weather update
+#define WEATHERUPDATEPERIOD 15*60000    // Minutes between weather updates
+// NTP stuff
+unsigned int localPort = 2390;          // local port to listen for UDP packets
+
+
+IPAddress timeServerIP; 
+const char* ntpServerName = NTP_POOL_URL;
+boolean ntp_ok = false; // flag set if last NTP request was successful
+const int NTP_PACKET_SIZE = 48; // NTP time stamp is in the first 48 bytes of the message
+
+byte packetBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
+
+// A UDP instance to let us send and receive packets over UDP
+WiFiUDP udp;
+
+// Timezone rules
+//
+//United Kingdom (London)
+TimeChangeRule BST = {"BST", Last, Sun, Mar, 1, 60};        //British Summer Time
+TimeChangeRule GMT = {"GMT", Last, Sun, Oct, 2, 0};         //Standard Time
+Timezone UK(BST, GMT);
+TimeChangeRule *tcr;        //pointer to the time change rule, use to get TZ abbrev
+time_t utc, local;
+char* months[]={"null","January","February","March","April","May","June","July","August","September","October","November","December"};
+
+struct Weather {
+   char  temp[6];
+   char  windspeed[6];
+   char winddirection[6]; 
+   char  weathertype[6];
+   char  rainpercent[6];
+   char  minssincemidnight[6];
+};
+
+
+struct Weather weather0, weather3, weather6;        /* Declare  weather of type Weather */
+
+
+#define SOFTWARE_VERSION "1.0.6ntp"
 #define DEFAULT_TIME_SERVER_URL "http://time-zone-server.scapp.io/getTime/Europe/Zurich"
 
-#define DEBUG_OFF             // DEBUG or DEBUG_OFF
+#define DEBUG             // DEBUG or DEBUG_OFF
 
 // Access point credentials, be default it is as open AP
 const char *ap_ssid = "NixieTimeModule";
@@ -39,7 +111,7 @@ const char *serialNumber = "0x0x0x";  // this is to be customized at burn time
 
 
 // Pin 1 on ESP-01, pin 2 on ESP-12E
-#define blueLedPin 1
+#define blueLedPin D4
 boolean blueLedState = true;
 
 // used for flashing the blue LED
@@ -48,7 +120,9 @@ int blinkTopTime = 2000;
 unsigned long lastMillis = 0;
 
 // Timer for how often we send the I2C data
-long lastI2CUpdateTime = 0;
+unsigned long lastI2CUpdateTime = 0;
+unsigned long updatetimer=20000;     // Time in milliseconds between time updates
+
 
 String timeServerURL = "";
 
@@ -104,7 +178,176 @@ byte configBlankMode;
 byte configSlotsMode;
 // For Proximity
 byte configUseProximity;
+
 ESP8266WebServer server(80);
+
+
+// ---------------------------------------------------------------------------------------------------
+// ------------------------------------------ DISPLAY FUNCTIONS --------------------------------------
+// ---------------------------------------------------------------------------------------------------
+
+/* ======================================================================
+  Function: drawFrameWifi
+  Purpose : WiFi logo and IP address
+  Input   : OLED display pointer
+  Output  : -
+  Comments: -
+  ====================================================================== */
+void drawFrameWifi(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y) {
+  display->clear();
+  display->setTextAlignment(TEXT_ALIGN_CENTER);
+  display->setFont(Roboto_Condensed_Bold_Bold_16);
+  // see http://blog.squix.org/2015/05/esp8266-nodemcu-how-to-create-xbm.html
+  // on how to create xbm files
+  display->drawXbm( x + (128 - WiFi_width) / 2, 0, WiFi_width, WiFi_height, WiFi_bits);
+
+  // Display Soft Access Point IP address if not connected.
+  if (WiFi.status() == WL_CONNECTED) {
+    display->drawString(x + 64, WiFi_height + 4, WiFi.localIP().toString());
+  } else {
+    display->drawString(x + 64, WiFi_height + 4, WiFi.softAPIP().toString());
+  }
+}
+
+/* ======================================================================
+  Function: drawFrameLogo
+  Purpose : Company logo info screen (called by OLED ui)
+  Input   : OLED display pointer
+  Output  : -
+  Comments: -
+  ====================================================================== */
+void drawFrameLogo(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y) {
+  display->clear();
+  display->drawXbm(x + (128 - stratacom_width) / 2, y, stratacom_width, stratacom_height, stratacom_bits);
+  //ui.disableIndicator();
+}
+/* ======================================================================
+  Function: drawWeather
+  Purpose : Todays weather (called by OLED ui)
+  Input   : OLED display pointer
+  Output  : -
+  Comments: -
+  ====================================================================== */
+
+void weatherdisplay(Weather * weather, int16_t x, int16_t y) {
+  
+  // Define a pointer to an array of arrays
+  const char *type[31] = { w0_bits, w1_bits, w2_bits, w3_bits, w4_bits, w5_bits, w6_bits, w7_bits, w8_bits,
+                           w9_bits, w10_bits, w11_bits, w12_bits, w13_bits, w14_bits, w15_bits, w16_bits, w17_bits,
+                           w18_bits, w19_bits, w20_bits, w21_bits, w22_bits, w23_bits, w24_bits, w25_bits, w26_bits,
+                           w27_bits, w28_bits, w29_bits, w30_bits };
+  // display an image referenced in an array of icons
+  display.clear();
+  display.drawXbm(0, 22,32, 32, type[atoi(weather->weathertype)]);
+  display.setFont(Roboto_Condensed_Bold_Bold_16);
+  display.drawString(24, 48, String(weather->temp)+ "°C" );
+  display.drawString(49, 24, String(weather->rainpercent)+ "%" );
+  // Define a pointer to an array of arrays for wind direction
+  const char *compass[17] = { N_bits, NNE_bits, NE_bits, ENE_bits, E_bits, ESE_bits, SE_bits, SSE_bits, 
+                              S_bits, SSW_bits, SW_bits, WSW_bits, W_bits, WNW_bits, NW_bits, NNW_bits, 
+                              STILL_bits };
+  String compasscode[17] = { "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S",
+                                "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW", "STILL" };
+
+  char compasspoint[6];
+  for( byte j = 0; j < 17; j++ ) {
+    if (compasscode[j] == String(weather->winddirection) ) {
+      display.drawXbm(90, 22,24, 24, compass[j]);
+    }
+  }
+  display.setFont(Roboto_Condensed_Bold_Bold_16);
+  display.drawString(102,48, String(weather->windspeed)+" mph" );
+  display.drawHorizontalLine(0,17,128);
+  display.setFont(Roboto_Condensed_Bold_Bold_16);
+  
+  // Calculate time period
+  int hour = atoi(weather->minssincemidnight)/60;
+  int hour3 = (hour +3) % 24;
+    // If DST add one hour to time
+  if (UK.locIsDST(now())) { 
+    hour = (hour +1) % 24;
+    hour3 = (hour3 +1) % 24;
+    }
+  display.drawString(x+64, y+0, String(hour)+":00 To "+String(hour3)+":00" );
+
+  return;
+}
+// Draw first weather frame  
+void drawWeather(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y) {
+  weatherdisplay(&weather0, x,y);
+}
+// Draw second weather frame
+void drawWeather3(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y) {
+  weatherdisplay(&weather3, x,y);
+}
+// Draw third weather frame
+void drawWeather6(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y) {
+  weatherdisplay(&weather6, x,y);
+}
+
+/* ======================================================================
+  Function: drawTimeDate
+  Purpose : Display Time and Date on OLED (called by OLED ui)
+  Input   : OLED display pointer
+  Output  : -
+  Comments: -
+  ====================================================================== */
+void drawTimeDate(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y) {
+  display->clear();
+  display->setTextAlignment(TEXT_ALIGN_CENTER);
+  display->setFont(Roboto_Condensed_Bold_Bold_16);
+#ifdef USE_NTP
+  display->drawString(64 + x, 40 + y, String(day())+" "+months[month()]);
+  display->setFont(ArialMT_Plain_24);
+  String hh= (hour() < 10) ? "0"+String(hour()) : String(hour());
+  String mm= (minute() < 10) ? "0"+String(minute()) : String(minute());
+  display->drawString(64 + x, 10 + y, hh+":"+mm);
+#else 
+  display->drawString(64 + x, 40 + y, String(daynow)+" "+months[monthnow]+" "+String(yearnow));
+  display->setFont(ArialMT_Plain_24);
+  display->drawString(64 + x, 10 + y, String(hournow)+":"+String(minutenow));
+#endif
+  //ui.disableIndicator();
+}
+
+// this array keeps function pointers to all frames
+// frames are the single views that slide from right to left
+  FrameCallback frames[] = { drawFrameLogo, drawFrameWifi, drawTimeDate, drawWeather, drawWeather3, drawWeather6, drawWeather};
+  int numberOfFrames = 7;
+
+/* ======================================================================
+  Function: drawProgress
+  Purpose : prograss indication
+  Input   : OLED display pointer
+          percent of progress (0..100)
+          String above progress bar
+          String below progress bar
+  Output  : -
+  Comments: -
+  ====================================================================== */
+void drawProgress(OLEDDisplay *display, int percentage, String labeltop, String labelbot) {
+  display->clear();
+  display->setTextAlignment(TEXT_ALIGN_CENTER);
+  display->setFont(Roboto_Condensed_Bold_Bold_16);
+  display->drawString(64, 8, labeltop);
+  display->drawProgressBar(10, 28, 108, 12, percentage);
+  display->drawString(64, 48, labelbot);
+  display->display();
+}
+
+/* ======================================================================
+  Function: drawProgress
+  Purpose : prograss indication
+  Input   : OLED display pointer
+          percent of progress (0..100)
+          String above progress bar
+  Output  : -
+  Comments: -
+  ====================================================================== */
+void drawProgress(OLEDDisplay *display, int percentage, String labeltop ) {
+  drawProgress(display, percentage, labeltop, String(""));
+}
+
 
 // ----------------------------------------------------------------------------------------------------
 // ----------------------------------------------  Set up  --------------------------------------------
@@ -115,10 +358,32 @@ void setup()
   Serial.begin(115200);
   Serial.println();
   Serial.println("Configuring access point...");
-//#else
+//#endif
   pinMode(PROXIMITY, INPUT);    // Input for proximity detection.
   pinMode(blueLedPin, OUTPUT);
-//#endif
+
+  Wire.begin(SDA_PIN, SDC_PIN); // SDA = 0, SCL = 2
+#ifdef DEBUG
+  Serial.println("I2C master started");
+#endif
+
+  // initialize display
+  display.init();
+  display.flipScreenVertically();
+  display.clear();
+  display.display();
+  display.setFont(ArialMT_Plain_10);
+  display.setTextAlignment(TEXT_ALIGN_CENTER);
+  display.setContrast(255);    
+
+  ui.setTargetFPS(15);
+  ui.setFrameAnimation(SLIDE_LEFT);
+  ui.setFrames(frames, numberOfFrames);
+  ui.setTimePerFrame(5000);
+  ui.setTimePerTransition(200);
+  ui.disableAllIndicators();
+  ui.init();
+  display.flipScreenVertically();
 
   EEPROM.begin(512);
   delay(10);
@@ -144,11 +409,13 @@ void setup()
 #ifdef DEBUG
     Serial.println("WiFi connected, stop softAP");
 #endif
+    drawProgress(&display, 100, F("Connected"));
     WiFi.mode(WIFI_STA);
   } else {
 #ifdef DEBUG
     Serial.println("WiFi not connected, start softAP");
 #endif
+    drawProgress(&display, 100, F("Started SoftAP"));
     WiFi.mode(WIFI_AP_STA);
     
     // You can add the password parameter if you want the AP to be password protected
@@ -168,11 +435,15 @@ void setup()
   Serial.println(myIP);
 #endif
 
-  Wire.begin(0, 2); // SDA = 0, SCL = 2
+
+// NTP setup
 #ifdef DEBUG
-  Serial.println("I2C master started");
+  Serial.println("Starting UDP");
+  Serial.print("Local port: ");
+  Serial.println(udp.localPort());
 #endif
-  
+  udp.begin(localPort);
+ 
   /* Set page handler functions */
   server.on("/",            rootPageHandler);
   server.on("/wlan_config", wlanPageHandler);
@@ -201,20 +472,36 @@ configUseProximity = EEPROM.read(EEPROM_PROXIMITY);    // Read saved configurati
 void loop()
 {
   server.handleClient();
-
+  
+  if (ui.getUiState()->currentFrame == 6 ) { ui.setAutoTransitionBackwards(); }   //Cycle between weather frames
+  if (ui.getUiState()->currentFrame == 3 ) { ui.setAutoTransitionForwards(); }
+  
+  int remainingTimeBudget = ui.update();
+  if (remainingTimeBudget > 0) {
+    // You can do some work here
+    // Don't do stuff if you are below your
+    // time budget.
+    delay(remainingTimeBudget);
+  }
   if (WiFi.status() == WL_CONNECTED) {
     if (lastMillis > millis()) {
       // rollover
       lastI2CUpdateTime = 0;
+      lastWeatherUpdateTime = 0;
     }
     
     // See if it is time to update the Clock
-    if (((millis() - lastI2CUpdateTime) > 60000) || 
+    if (((millis() - lastI2CUpdateTime) > updatetimer) || 
          (lastI2CUpdateTime==0)
        ) {
 
+#ifdef USE_NTP
+      // Now recover the current time using NTP protocol
+      String timeStr = getTimeFromNtpServer();
+#else      
       // Try to recover the current time
       String timeStr = getTimeFromTimeZoneServer();
+#endif
 
       // Send the time to the I2C client, but only if there was no error
       if (!timeStr.startsWith("ERROR:")) {
@@ -241,6 +528,25 @@ void loop()
       lastI2CUpdateTime = millis();
     }
 
+
+    // See if it is time to update the Weather
+    if (((millis() - lastWeatherUpdateTime) > WEATHERUPDATEPERIOD) || (lastWeatherUpdateTime==0)) {
+      fetchweather();
+      lastWeatherUpdateTime = millis();
+    }
+    if (((millis() - lastMillis) > blinkTopTime) && blueLedState) {
+      lastMillis = millis();
+      blueLedState = false;
+#ifdef DEBUG
+      //setBlueLED(blueLedState);
+#endif
+    } else if (((millis() - lastMillis) > blinkOnTime) && !blueLedState) {
+      blueLedState = true;
+#ifdef DEBUG
+      //setBlueLED(blueLedState);
+#endif    
+    }
+ 
 //  Proximity detection
 //-----------------------------------------
     boolean proximity= digitalRead(PROXIMITY);
@@ -277,28 +583,15 @@ void loop()
         setClockOptionBoolean(I2C_PROXIMITY_BLANK, false);
         }
       } 
-    }
-
+    }  
   } else {
     // offline, flash fast
     blinkOnTime = 100;
     blinkTopTime = 200;
 #ifdef DEBUG
-    Serial.println("Offline");
+    //Serial.println("Offline");
 #endif
-  }
   
-  if (((millis() - lastMillis) > blinkTopTime) && blueLedState) {
-    lastMillis = millis();
-    blueLedState = false;
-#ifndef DEBUG
-    //setBlueLED(blueLedState);
-#endif
-  } else if (((millis() - lastMillis) > blinkOnTime) && !blueLedState) {
-    blueLedState = true;
-#ifndef DEBUG
-    //setBlueLED(blueLedState);
-#endif    
   }
 }
 
@@ -311,6 +604,9 @@ void loop()
 */
 void rootPageHandler()
 {
+#ifdef DEBUG
+    Serial.println("Serving home page");
+#endif
   String response_message = getHTMLHead();
   response_message += getNavBar();
 
@@ -325,8 +621,12 @@ void rootPageHandler()
     response_message += getTableRow2Col("WLAN IP", ipStr);
     response_message += getTableRow2Col("WLAN MAC", WiFi.macAddress());
     response_message += getTableRow2Col("WLAN SSID", WiFi.SSID());
+#ifdef USE_NTP
+    response_message += getTableRow2Col("Time according to server", String(hour())+":"+String(minute())+"  "+String(day())+","+String(month())+","+String(year()));
+#else
     response_message += getTableRow2Col("Time server URL", timeServerURL);
     response_message += getTableRow2Col("Time according to server", getTimeFromTimeZoneServer());
+#endif
   }
   else
   {
@@ -729,6 +1029,7 @@ void clockConfigPageHandler()
     }
   }
 
+
 //Proximity Option set
   if (server.hasArg("useProximity"))
   {
@@ -752,6 +1053,7 @@ void clockConfigPageHandler()
     EEPROM.write(EEPROM_PROXIMITY,configUseProximity);
     EEPROM.commit();
   }
+
 
   // -----------------------------------------------------------------------------
 
@@ -1056,8 +1358,8 @@ void clockConfigPageHandler()
   response_message += getDropDownOption("1", "Blank LEDs only", (configBlankMode == 1));
   response_message += getDropDownOption("2", "Blank tubes and LEDs", (configBlankMode == 2));
   response_message += getDropDownFooter();
-  
   boolean hoursDisabled = (configDayBlanking < 4);
+
   
   // Proximity Blanking
   response_message += getRadioGroupHeader("Use Proximity Blanking");
@@ -1198,6 +1500,7 @@ String getTimeFromTimeZoneServer() {
   // file found at server
   if (httpCode == HTTP_CODE_OK) {
     payload = http.getString();
+    updatetimer=LONGUPDATE;     // 1 hour default between time updates
   } else {
 #ifdef DEBUG
     Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
@@ -1209,6 +1512,7 @@ String getTimeFromTimeZoneServer() {
       // ESP error codes have a string mapping
       payload = "ERROR: " + String(httpCode) + " ("+ http.errorToString(httpCode) + ")";
     }
+    updatetimer=SHORTUPDATE;     // 60 sec default between time updates
   }    
 
   http.end();
@@ -1369,6 +1673,7 @@ void wipeEEPROM() {
 }
 
 
+
 // ----------------------------------------------------------------------------------------------------
 // ----------------------------------------- Utility functions ----------------------------------------
 // ----------------------------------------------------------------------------------------------------
@@ -1417,14 +1722,14 @@ int getIntValue(String data, char separator, int index) {
  */
 boolean sendTimeToI2C(String timeString) {
 
-  int year = getIntValue(timeString, ',', 0);
-  byte month = getIntValue(timeString, ',', 1);
-  byte day = getIntValue(timeString, ',', 2);
-  byte hour = getIntValue(timeString, ',', 3);
-  byte minute = getIntValue(timeString, ',', 4);
-  byte sec = getIntValue(timeString, ',', 5);
+  int yearnow = getIntValue(timeString, ',', 0);
+  byte monthnow = getIntValue(timeString, ',', 1);
+  byte daynow = getIntValue(timeString, ',', 2);
+  byte hournow = getIntValue(timeString, ',', 3);
+  byte minutenow = getIntValue(timeString, ',', 4);
+  byte secnow = getIntValue(timeString, ',', 5);
 
-  byte yearAdjusted = (year - 2000);
+  byte yearAdjusted = (yearnow - 2000);
 
 #ifdef DEBUG
   Serial.println("Sending time to I2C");
@@ -1433,12 +1738,21 @@ boolean sendTimeToI2C(String timeString) {
 
   Wire.beginTransmission(I2C_SLAVE_ADDR);
   Wire.write(I2C_TIME_UPDATE); // Command
+#ifdef USE_NTP
+  Wire.write(year()-2000);
+  Wire.write(month());
+  Wire.write(day());
+  Wire.write(hour());
+  Wire.write(minute());
+  Wire.write(second());
+#else
   Wire.write(yearAdjusted);
-  Wire.write(month);
-  Wire.write(day);
-  Wire.write(hour);
-  Wire.write(minute);
-  Wire.write(sec);
+  Wire.write(monthnow);
+  Wire.write(daynow);
+  Wire.write(hournow);
+  Wire.write(minutenow);
+  Wire.write(secnow);
+#endif
   int error = Wire.endTransmission();
   return (error == 0);
 }
@@ -1769,8 +2083,8 @@ String getHTMLHead() {
   if (WiFi.status() == WL_CONNECTED) {
     header += "<link href=\"https://maxcdn.bootstrapcdn.com/bootstrap/3.3.6/css/bootstrap.min.css\" rel=\"stylesheet\" integrity=\"sha384-1q8mTJOASx8j1Au+a5WDVnPi2lkFfwwEAa8hDDdjZlpLegxhjVME1fgjWPGmkzs7\" crossorigin=\"anonymous\">";
     header += "<link href=\"http://www.open-rate.com/wl.css\" rel=\"stylesheet\" type=\"text/css\">";
-    header += "<script src=\"http://code.jquery.com/jquery-1.12.3.min.js\" integrity=\"sha256-aaODHAgvwQW1bFOGXMeX+pC4PZIPsvn2h1sArYOhgXQ=\" crossorigin=\"anonymous\"></script>";
-    header += "<script src=\"https://maxcdn.bootstrapcdn.com/bootstrap/3.3.6/js/bootstrap.min.js\" integrity=\"sha384-0mSbJDEHialfmuBBQP6A4Qrprq5OVfW37PRR3j5ELqxss1yVqOtnepnHVP9aJ7xS\" crossorigin=\"anonymous\"></script>";
+    //header += "<script src=\"http://code.jquery.com/jquery-1.12.3.min.js\" integrity=\"sha256-aaODHAgvwQW1bFOGXMeX+pC4PZIPsvn2h1sArYOhgXQ=\" crossorigin=\"anonymous\"></script>";
+    //header += "<script src=\"https://maxcdn.bootstrapcdn.com/bootstrap/3.3.6/js/bootstrap.min.js\" integrity=\"sha384-0mSbJDEHialfmuBBQP6A4Qrprq5OVfW37PRR3j5ELqxss1yVqOtnepnHVP9aJ7xS\" crossorigin=\"anonymous\"></script>";
   } else {
     header += "<link href=\"local.css\" rel=\"stylesheet\">";
   }
@@ -1787,7 +2101,11 @@ String getNavBar() {
   navbar += "<div class=\"container-fluid\"><div class=\"navbar-header\"><button type=\"button\" class=\"navbar-toggle collapsed\" data-toggle=\"collapse\" data-target=\"#navbar\" aria-expanded=\"false\" aria-controls=\"navbar\">";
   navbar += "<span class=\"sr-only\">Toggle navigation</span><span class=\"icon-bar\"></span><span class=\"icon-bar\"></span><span class=\"icon-bar\"></span></button>";
   navbar += "<a class=\"navbar-brand\" href=\"#\">Arduino Nixie Clock Time Module</a></div><div id=\"navbar\" class=\"navbar-collapse collapse\"><ul class=\"nav navbar-nav navbar-right\">";
+#ifdef USE_NTP
+  navbar += "<li><a href=\"/\">Summary</a></li><li><li><a href=\"/wlan_config\">Configure WLAN settings</a></li><li><a href=\"/clockconfig\">Configure clock settings</a></li></ul></div></div></nav>";
+#else
   navbar += "<li><a href=\"/\">Summary</a></li><li><a href=\"/time\">Configure Time Server</a></li><li><a href=\"/wlan_config\">Configure WLAN settings</a></li><li><a href=\"/clockconfig\">Configure clock settings</a></li></ul></div></div></nav>";
+#endif
   return navbar;
 } 
 
@@ -2019,4 +2337,228 @@ String getSubmitButton(String buttonText) {
   result += "\"></div></div>";
   return result;
 }
+
+
+
+// --------------------------------------------------------------------------------------------------
+// -------------------------------------------NTP functions -----------------------------------------
+// --------------------------------------------------------------------------------------------------
+
+// send an NTP request to the time server at the given address
+unsigned long sendNTPpacket(IPAddress& address)
+{
+  Serial.println("sending NTP packet...");
+  // set all bytes in the buffer to 0
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  // Initialize values needed to form NTP request
+  // (see URL above for details on the packets)
+  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+  packetBuffer[1] = 0;     // Stratum, or type of clock
+  packetBuffer[2] = 6;     // Polling Interval
+  packetBuffer[3] = 0xEC;  // Peer Clock Precision
+  // 8 bytes of zero for Root Delay & Root Dispersion
+  packetBuffer[12]  = 49;
+  packetBuffer[13]  = 0x4E;
+  packetBuffer[14]  = 49;
+  packetBuffer[15]  = 52;
+
+  // all NTP fields have been given values, now
+  // you can send a packet requesting a timestamp:
+  udp.beginPacket(address, 123); //NTP requests are to port 123
+  udp.write(packetBuffer, NTP_PACKET_SIZE);
+  udp.endPacket();
+}
+
+/**
+ *       Code for NTP time server
+         -----------------------
+   Get the local time from the NTP server. Return the string "ERROR:" if something went wrong.
+*/
+String getTimeFromNtpServer() {
+      String payload = "";
+      if ( !ntp_ok ) {
+        //get a random server from the pool if last request did not work else use previous IP address
+        WiFi.hostByName(ntpServerName, timeServerIP); 
+      }
+      sendNTPpacket(timeServerIP); // send an NTP packet to a time server
+      // wait to see if a reply is available
+      delay(2000);
+        int cb = udp.parsePacket();
+  if (!cb) {
+#ifdef DEBUG    
+    Serial.println("no packet yet");
+#endif    
+    payload = "ERROR: ";
+    ntp_ok = false;
+    updatetimer=SHORTUPDATE;     // 60 sec default between time updates
+    return payload;
+  }
+  else {
+#ifdef DEBUG    
+    Serial.print("packet received, length=");
+    Serial.println(cb);
+#endif    
+    ntp_ok = true;
+    // We've received a packet, read the data from it
+    udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
+
+    //the timestamp starts at byte 40 of the received packet and is four bytes,
+    // or two words, long. First, esxtract the two words:
+
+    unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+    unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
+    // combine the four bytes (two words) into a long integer
+    // this is NTP time (seconds since Jan 1 1900):
+    unsigned long secsSince1900 = highWord << 16 | lowWord;
+
+    // now convert NTP time into everyday time:
+    // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
+    const unsigned long seventyYears = 2208988800UL;
+    // subtract seventy years:
+    unsigned long epoch = secsSince1900 - seventyYears;
+    local = UK.toLocal(epoch, &tcr);    // Convert to local time
+    setTime(local);                     // Set clock to local time
+
+#ifdef DEBUG   
+    // print NTP time
+    Serial.print("Seconds since Jan 1 1900 = " );
+    Serial.println(secsSince1900);
+    // print Unix time:
+    Serial.print("Unix time = ");
+    Serial.println(epoch);
+
+    // print the hour, minute and second:
+    Serial.print("The UTC time is ");       // UTC is the time at Greenwich Meridian (GMT)
+    Serial.print((epoch  % 86400L) / 3600); // print the hour (86400 equals secs per day)
+    Serial.print(':');
+    if ( ((epoch % 3600) / 60) < 10 ) {
+      // In the first 10 minutes of each hour, we'll want a leading '0'
+      Serial.print('0');
+    }
+    Serial.print((epoch  % 3600) / 60); // print the minute (3600 equals secs per minute)
+    Serial.print(':');
+    if ( (epoch % 60) < 10 ) {
+      // In the first 10 seconds of each minute, we'll want a leading '0'
+      Serial.print('0');
+    }
+    Serial.println(epoch % 60); // print the second
+
+    Serial.print("Local time is ");
+    if ( hour() < 10 ) {
+      Serial.print('0');
+    }
+    Serial.print(hour());
+    Serial.print(':');
+    if ( minute() < 10 ) {
+      Serial.print('0');
+    }
+    Serial.print(minute());
+    Serial.print(':');
+    Serial.print(second());
+    Serial.print(" ");
+    Serial.print(day());
+    Serial.print(" ");
+    Serial.print(months[month()]);
+    Serial.print(" ");
+    Serial.print(year()); 
+    Serial.println();
+#endif
+    updatetimer=LONGUPDATE;     // 120 sec default between time updates
+    return payload;
+  }
+
+}
+
+// --------------------------------------------------------------------------------------------------
+// ------------------------------------------- Weather functions ------------------------------------
+// --------------------------------------------------------------------------------------------------
+bool fetchweather(){
+  HTTPClient http;
+  http.begin(String(WEATHER_SERVER_URL)+String(WEATHER_LOCATION_ID)+"?res=3hourly&key="+String(WEATHER_API_KEY));   //Fetch weather forecast from UK Met Office
+  // start connection and send HTTP header
+  int httpCode = http.GET();
+  // httpCode will be negative on error
+  if(httpCode > 0) {
+    // HTTP header has been send and Server response header has been handled
+#ifdef DEBUG
+    Serial.printf("[HTTP] GET... code: %d\n", httpCode);
+#endif
+   } else {
+#ifdef DEBUG
+      Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
+#endif
+      return false;
+   }
+
+   // Allocate a temporary memory pool
+   DynamicJsonBuffer jsonBuffer(http.getSize()+64);
+   WiFiClient * stream = http.getStreamPtr();
+   JsonObject& root = jsonBuffer.parseObject(*stream);
+
+   if (!root.success()) {
+#ifdef DEBUG
+     Serial.println("JSON parsing failed!");
+#endif
+     return false;
+   }
+
+   int minutestoday = elapsedSecsToday(UK.toUTC(now()))/60;
+   int j[]= {0,0,0};   // Find which data series correspond to present period
+   int i[]= {0,0,0};   // Array to address the json fields for 3 time periods
+   
+   int datasetsize[] = { root["SiteRep"]["DV"]["Location"]["Period"][0]["Rep"].size(),
+                         root["SiteRep"]["DV"]["Location"]["Period"][1]["Rep"].size()  };
+
+   
+   for ( int l=1; l>=0; l--) {
+
+    for ( int k=datasetsize[l]-1; k>=0; k-- ) {
+
+      if ( minutestoday < 180+atoi(root["SiteRep"]["DV"]["Location"]["Period"][l]["Rep"][k]["$"] )) {
+        j[0]=k;
+        i[0]=l;        
+      }
+      
+      if ( minutestoday+180 < l*1440 + 180+ atoi(root["SiteRep"]["DV"]["Location"]["Period"][l]["Rep"][k]["$"] )) {
+        j[1]=k;
+        i[1]=l;
+      } 
+      
+      if ( minutestoday+360 < l*1440 + 180 + atoi(root["SiteRep"]["DV"]["Location"]["Period"][l]["Rep"][k]["$"] )) {
+        j[2]=k;
+        i[2]=l;
+      }     
+    }
+   }
+
+  
+
+   
+   strcpy( weather0.temp, root["SiteRep"]["DV"]["Location"]["Period"][i[0]]["Rep"][j[0]]["T"]);
+   strcpy( weather0.winddirection, root["SiteRep"]["DV"]["Location"]["Period"][i[0]]["Rep"][j[0]]["D"]);
+   strcpy( weather0.windspeed, root["SiteRep"]["DV"]["Location"]["Period"][i[0]]["Rep"][j[0]]["S"]);
+   strcpy( weather0.rainpercent, root["SiteRep"]["DV"]["Location"]["Period"][i[0]]["Rep"][j[0]]["Pp"]);
+   strcpy( weather0.weathertype, root["SiteRep"]["DV"]["Location"]["Period"][i[0]]["Rep"][j[0]]["W"]);
+   strcpy( weather0.minssincemidnight, root["SiteRep"]["DV"]["Location"]["Period"][i[0]]["Rep"][j[0]]["$"]);
+
+   strcpy( weather3.temp, root["SiteRep"]["DV"]["Location"]["Period"][i[1]]["Rep"][j[1]]["T"]);
+   strcpy( weather3.winddirection, root["SiteRep"]["DV"]["Location"]["Period"][i[1]]["Rep"][j[1]]["D"]);
+   strcpy( weather3.windspeed, root["SiteRep"]["DV"]["Location"]["Period"][i[1]]["Rep"][j[1]]["S"]);
+   strcpy( weather3.rainpercent, root["SiteRep"]["DV"]["Location"]["Period"][i[1]]["Rep"][j[1]]["Pp"]);
+   strcpy( weather3.weathertype, root["SiteRep"]["DV"]["Location"]["Period"][i[1]]["Rep"][j[1]]["W"]);
+   strcpy( weather3.minssincemidnight, root["SiteRep"]["DV"]["Location"]["Period"][i[1]]["Rep"][j[1]]["$"]);
+
+   strcpy( weather6.temp, root["SiteRep"]["DV"]["Location"]["Period"][i[2]]["Rep"][j[2]]["T"]);
+   strcpy( weather6.winddirection, root["SiteRep"]["DV"]["Location"]["Period"][i[2]]["Rep"][j[2]]["D"]);
+   strcpy( weather6.windspeed, root["SiteRep"]["DV"]["Location"]["Period"][i[2]]["Rep"][j[2]]["S"]);
+   strcpy( weather6.rainpercent, root["SiteRep"]["DV"]["Location"]["Period"][i[2]]["Rep"][j[2]]["Pp"]);
+   strcpy( weather6.weathertype, root["SiteRep"]["DV"]["Location"]["Period"][i[2]]["Rep"][j[2]]["W"]);
+   strcpy( weather6.minssincemidnight, root["SiteRep"]["DV"]["Location"]["Period"][i[2]]["Rep"][j[2]]["$"]);  
+
+   
+   http.end();
+   return true;
+}
+
+
 
