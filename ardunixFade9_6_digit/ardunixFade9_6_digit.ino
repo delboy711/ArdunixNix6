@@ -298,6 +298,10 @@
 #define I2C_SET_OPTION_BLANK_MODE     0x14
 #define I2C_SET_OPTION_SLOTS_MODE     0x15
 
+// I2C  Proximity Detect Blank Tubes
+#define I2C_PROXIMITY_BLANK           0x80
+
+
 
 //**********************************************************************************
 //**********************************************************************************
@@ -3732,7 +3736,19 @@ void receiveEvent(int bytes) {
   } else if (operation == I2C_SET_OPTION_SLOTS_MODE) {
     slotsMode = Wire.read();
     EEPROM.write(EE_SLOTS_MODE, slotsMode);
-  }
+
+  // Operation to blank/unblank tubes under control of the master
+  // without writing to EEPROM
+  } else if (operation == I2C_PROXIMITY_BLANK) {
+    if ( Wire.read() ) {
+      dayBlanking = DAY_BLANKING_ALWAYS;
+    } else {
+        dayBlanking = EEPROM.read(EE_DAY_BLANKING);
+        if ((dayBlanking < DAY_BLANKING_MIN) || (dayBlanking > DAY_BLANKING_MAX)) {
+          dayBlanking = DAY_BLANKING_DEFAULT;
+        }
+    }
+  }  
 }
 
 /**
