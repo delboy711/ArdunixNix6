@@ -13,6 +13,7 @@ When building my own clock I made a few modifications to the code to add some ex
 For the NTP updates I used a Wemos D1 mini ESP8266 board, but any ESP8266 based device would work OK.
 Because I was only doing this for my own clock some features such as using UK Met Office are hard coded.<br>
 There is a new option defined in the clock configuration to allow disabling the movement detector blanking.<br>
+![Nixie clock with OLED display and movement sensor](https://github.com/delboy711/ArdunixNix6/images/dereks_nixie.jpg)
 
 #####################################################################################<br>
 
