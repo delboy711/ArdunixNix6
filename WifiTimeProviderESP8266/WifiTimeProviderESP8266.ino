@@ -17,6 +17,14 @@
 #include <Wire.h>
 #include <EEPROM.h>
 #include <time.h>
+
+// For proximity detection
+#define PROXIMITY D5    // Input for proximity detector
+#define PROXIMITY_TIMEOUT   3*60*1000  // Period of time in minutes without proximity detection before blanking tubes
+#define EEPROM_PROXIMITY 353          // EEPROM memory location for proximity config
+boolean proximityStatus = true;   
+unsigned long lastproximityTime;      // Timestamp of high to low transition of proximity sensor
+
   
 #define SOFTWARE_VERSION "1.0.6"
 #define DEFAULT_TIME_SERVER_URL "http://time-zone-server.scapp.io/getTime/Europe/Zurich"
@@ -71,6 +79,9 @@ ADC_MODE(ADC_VCC);
 #define I2C_SET_OPTION_BLANK_MODE     0x14
 #define I2C_SET_OPTION_SLOTS_MODE     0x15
 
+// To blank tubes by proximity detection
+#define I2C_PROXIMITY_BLANK     0x80
+
 // Clock config
 byte configHourMode;
 byte configBlankLead;
@@ -91,7 +102,8 @@ byte configUseFade;
 byte configUseLDR;
 byte configBlankMode;
 byte configSlotsMode;
-
+// For Proximity
+byte configUseProximity;
 ESP8266WebServer server(80);
 
 // ----------------------------------------------------------------------------------------------------
@@ -99,13 +111,14 @@ ESP8266WebServer server(80);
 // ----------------------------------------------------------------------------------------------------
 void setup()
 {
-#ifdef DEBUG
+//#ifdef DEBUG
   Serial.begin(115200);
   Serial.println();
   Serial.println("Configuring access point...");
-#else
+//#else
+  pinMode(PROXIMITY, INPUT);    // Input for proximity detection.
   pinMode(blueLedPin, OUTPUT);
-#endif
+//#endif
 
   EEPROM.begin(512);
   delay(10);
@@ -175,6 +188,11 @@ void setup()
 #ifdef DEBUG
   Serial.println("HTTP server started");
 #endif
+
+// Proximity Setup
+unsigned long proximitytimeout = PROXIMITY_TIMEOUT;
+configUseProximity = EEPROM.read(EEPROM_PROXIMITY);    // Read saved configuration status
+
 }
 
 // ----------------------------------------------------------------------------------------------------
@@ -222,6 +240,45 @@ void loop()
 
       lastI2CUpdateTime = millis();
     }
+
+//  Proximity detection
+//-----------------------------------------
+    boolean proximity= digitalRead(PROXIMITY);
+   digitalWrite(blueLedPin, proximity); 
+//#ifdef DEBUG
+   setBlueLED(proximity);
+//#endif
+    if (configUseProximity) {
+
+      if (proximity && !proximityStatus) {    //Status change from inactive to active
+        //Send I2C message to unblank tubes if blanked
+        setClockOptionBoolean(I2C_PROXIMITY_BLANK, true);
+#ifdef DEBUG
+        Serial.println("Proximity unblanking");
+#endif
+        proximityStatus = true;
+        lastproximityTime = millis();
+      }
+      if (!proximity && proximityStatus) {    //Status change from active to inactive
+      // Start timeout after which we blank tubes
+        lastproximityTime = millis();   //Remember timestamp of high to low transition
+        proximityStatus = false;
+      }
+      if (!proximity && !proximityStatus) {    //Still inactive check if timer has expired
+        if (millis() < lastproximityTime ) {   //Rollover clear transition status restart timer
+          lastproximityTime = millis();
+        }
+      if ( lastproximityTime + PROXIMITY_TIMEOUT < millis() ) {   // Timer expired
+        lastproximityTime = millis(); 
+      // Timer expired blank tubes
+#ifdef DEBUG
+        Serial.println("Proximity blanking");
+#endif
+        setClockOptionBoolean(I2C_PROXIMITY_BLANK, false);
+        }
+      } 
+    }
+
   } else {
     // offline, flash fast
     blinkOnTime = 100;
@@ -235,12 +292,12 @@ void loop()
     lastMillis = millis();
     blueLedState = false;
 #ifndef DEBUG
-    setBlueLED(blueLedState);
+    //setBlueLED(blueLedState);
 #endif
   } else if (((millis() - lastMillis) > blinkOnTime) && !blueLedState) {
     blueLedState = true;
 #ifndef DEBUG
-    setBlueLED(blueLedState);
+    //setBlueLED(blueLedState);
 #endif    
   }
 }
@@ -672,6 +729,30 @@ void clockConfigPageHandler()
     }
   }
 
+//Proximity Option set
+  if (server.hasArg("useProximity"))
+  {
+#ifdef DEBUG
+    Serial.print("Got useProximity param: "); Serial.println(server.arg("useProximity"));
+#endif
+    if ((server.arg("useProximity") == "on") && (!configUseProximity)) {
+#ifdef DEBUG
+      Serial.println(" Set useProximity on");
+#endif
+      configUseProximity=1;
+    }
+
+    if ((server.arg("useProximity") == "off") && (configUseProximity)) {
+#ifdef DEBUG
+      Serial.println(" Set useProximity off");
+#endif
+      configUseProximity=0;
+    }
+    // Save to EEPROM
+    EEPROM.write(EEPROM_PROXIMITY,configUseProximity);
+    EEPROM.commit();
+  }
+
   // -----------------------------------------------------------------------------
 
   if (server.hasArg("dateFormat")) {
@@ -977,6 +1058,12 @@ void clockConfigPageHandler()
   response_message += getDropDownFooter();
   
   boolean hoursDisabled = (configDayBlanking < 4);
+  
+  // Proximity Blanking
+  response_message += getRadioGroupHeader("Use Proximity Blanking");
+  response_message += getRadioButton("useProximity", "On", "on", (configUseProximity==1));  
+  response_message += getRadioButton("useProximity", "Off", "off",(configUseProximity==0));
+  response_message += getRadioGroupFooter();
 
   // Blank hours from
   response_message += getNumberInput("Blank from:", "blankFrom", 0, 23, configBlankFrom, hoursDisabled);
