@@ -1,7 +1,7 @@
 # ArdunixNix6
 Nixie Clock based on Arduino<br>
 
-This is a fork of Ian Smarts excellent Nixie Clock<br>
+This is a fork of Ian Sparkes excellent Nixie Clock<br>
 https://github.com/isparkes/ArdunixNix6<br>
 
 When building my own clock I made a few modifications to the code to add some extra features.<br>
