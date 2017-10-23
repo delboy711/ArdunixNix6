@@ -14,6 +14,7 @@
 #include <WiFiClient.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266HTTPClient.h>
+#include <ESP8266mDNS.h>
 #include <Wire.h>
 #include <EEPROM.h>
 #include <time.h>
@@ -435,7 +436,6 @@ void setup()
   Serial.println(myIP);
 #endif
 
-
 // NTP setup
 #ifdef DEBUG
   Serial.println("Starting UDP");
@@ -459,6 +459,13 @@ void setup()
 #ifdef DEBUG
   Serial.println("HTTP server started");
 #endif
+  // Set up mDNS 
+  MDNS.begin("nixieclock");
+#ifdef DEBUG
+  Serial.println("mDNS responder started");
+#endif
+  // Add service to MDNS-SD
+  MDNS.addService("http", "tcp", 80);
 
 // Proximity Setup
 unsigned long proximitytimeout = PROXIMITY_TIMEOUT;
