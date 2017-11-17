@@ -22,6 +22,8 @@
 #include <WiFiUdp.h>
 #include <Timezone.h>
 #include <ArduinoJson.h>
+#include <Adafruit_SHT31.h>   //I2C temp sensor
+#include <PubSubClient.h>     // MQTT Publish
 
 
 // For OLED display
@@ -62,6 +64,8 @@ OLEDDisplayUi ui( &display );
 #define WEATHER_API_KEY "====My Met Office API Key===="   
 unsigned long lastWeatherUpdateTime;    // time of  last weather update
 #define WEATHERUPDATEPERIOD 15*60000    // Minutes between weather updates
+#define TEMPERATUREUPDATEPERIOD 60000    // Minutes between temperature updates
+unsigned long lastTempUpdateTime;       // time of  last temperature update
 // NTP stuff
 unsigned int localPort = 2390;          // local port to listen for UDP packets
 
@@ -75,6 +79,24 @@ byte packetBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing pack
 
 // A UDP instance to let us send and receive packets over UDP
 WiFiUDP udp;
+
+// SHT30 Temp/Humidity sensor
+Adafruit_SHT31 sht31 = Adafruit_SHT31();  // Declare I2C Temp/Humidity chip
+float temp = 0;       // room temperature
+float humidity = 0;   // room humidity
+boolean has_sht30 = false;    // flag set if SHT30/31 fitted
+byte sht30_address = 0x44;    // Try 0x44 first, and then 0x45 if not found
+
+//  MQTT defines
+IPAddress mqttServerIP;
+WiFiClient espClient;
+PubSubClient mqttclient(espClient);
+long lastMsg = 0;
+char msg[50];
+int value = 0;
+// name of MQTT broker
+//const char* mqttServerName = "cloudserver.local";
+const char* mqttServerName = "192.168.1.4";
 
 // Timezone rules
 //
@@ -286,6 +308,27 @@ void drawWeather6(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, in
   weatherdisplay(&weather6, x,y);
 }
 
+
+/* ======================================================================
+  Function: drawTempHumidity
+  Purpose : Display Crrent room Temperature and Humidity on OLED (called by OLED ui)
+  Input   : OLED display pointer
+  Output  : -
+  Comments: -
+  ====================================================================== */
+void drawTempHumidity(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y) {
+  if (!has_sht30) return;
+  char buffer [10];
+  String s= dtostrf( temp,5,2,buffer);
+  display->clear();
+  display->setTextAlignment(TEXT_ALIGN_CENTER);
+  display->setFont(Roboto_Condensed_Bold_Bold_16);
+  display->drawString(64 + x, 40 + y, "Temp "+ s + "°C");
+  display->setFont(ArialMT_Plain_24);
+  s= dtostrf( humidity,3,0,buffer);
+  display->drawString(64 + x, 10 + y, "Humidity "+ s + "%");
+}
+
 /* ======================================================================
   Function: drawTimeDate
   Purpose : Display Time and Date on OLED (called by OLED ui)
@@ -313,8 +356,8 @@ void drawTimeDate(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, in
 
 // this array keeps function pointers to all frames
 // frames are the single views that slide from right to left
-  FrameCallback frames[] = { drawFrameLogo, drawFrameWifi, drawTimeDate, drawWeather, drawWeather3, drawWeather6, drawWeather};
-  int numberOfFrames = 7;
+  FrameCallback frames[] = { drawFrameLogo, drawFrameWifi, drawTimeDate, drawWeather, drawWeather3, drawWeather6, drawWeather, drawTempHumidity};
+  int numberOfFrames = 8;
 
 /* ======================================================================
   Function: drawProgress
@@ -366,8 +409,26 @@ void setup()
   Wire.begin(SDA_PIN, SDC_PIN); // SDA = 0, SCL = 2
 #ifdef DEBUG
   Serial.println("I2C master started");
+  Serial.println("SHT30 test");
 #endif
 
+// Scan I2C bus for SHT30/31
+  for (int idx = 0x44 ; idx < 0x45 ; idx++)
+  {
+    Wire.beginTransmission(idx);
+    int error = Wire.endTransmission();
+    if (error == 0) {
+#ifdef DEBUG
+      Serial.print("Found SHT30/31 at");
+      Serial.println(idx);
+#endif 
+      has_sht30 = true;
+      sht30_address = idx;
+    }
+  }
+  if(has_sht30) sht31.begin(sht30_address);
+
+  
   // initialize display
   display.init();
   display.flipScreenVertically();
@@ -459,14 +520,20 @@ void setup()
 #ifdef DEBUG
   Serial.println("HTTP server started");
 #endif
+
+// Set up MQTT client
+  mqttclient.setServer(mqttServerName, 1883);
+#ifdef DEBUG
+  Serial.println("MQTT client started");
+#endif
   // Set up mDNS 
-  MDNS.begin("nixieclock");
+  MDNS.begin("nixieclock"); 
+  delay(1000);
 #ifdef DEBUG
   Serial.println("mDNS responder started");
 #endif
   // Add service to MDNS-SD
   MDNS.addService("http", "tcp", 80);
-
 // Proximity Setup
 unsigned long proximitytimeout = PROXIMITY_TIMEOUT;
 configUseProximity = EEPROM.read(EEPROM_PROXIMITY);    // Read saved configuration status
@@ -480,7 +547,7 @@ void loop()
 {
   server.handleClient();
   
-  if (ui.getUiState()->currentFrame == 6 ) { ui.setAutoTransitionBackwards(); }   //Cycle between weather frames
+  if (ui.getUiState()->currentFrame == has_sht30 ? 7:6 ) { ui.setAutoTransitionBackwards(); }   //Cycle between weather frames as well as room temp if sht30 fitted
   if (ui.getUiState()->currentFrame == 3 ) { ui.setAutoTransitionForwards(); }
   
   int remainingTimeBudget = ui.update();
@@ -495,6 +562,7 @@ void loop()
       // rollover
       lastI2CUpdateTime = 0;
       lastWeatherUpdateTime = 0;
+      lastTempUpdateTime = 0;
     }
     
     // See if it is time to update the Clock
@@ -553,6 +621,12 @@ void loop()
       //setBlueLED(blueLedState);
 #endif    
     }
+
+    // See if it is time to update the Temp/Humidity
+    if (((millis() - lastTempUpdateTime) > TEMPERATUREUPDATEPERIOD) || (lastTempUpdateTime==0)) {
+      readtemp();
+      lastTempUpdateTime = millis();
+    } 
  
 //  Proximity detection
 //-----------------------------------------
@@ -600,6 +674,7 @@ void loop()
 #endif
   
   }
+  mqttclient.loop();
 }
 
 // ----------------------------------------------------------------------------------------------------
@@ -2567,5 +2642,55 @@ bool fetchweather(){
    return true;
 }
 
+
+//******************************************************************************
+// MQTT, Temp and Humidity Functions
+//*******************************************************************************
+
+void reconnect() {
+  // Check if we're reconnected to MQTT server
+  if (!mqttclient.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Create a random client ID
+    String clientId = "ESP8266-NixieClock-";
+    clientId += String(random(0xffff), HEX);
+    // Attempt to connect
+    if (mqttclient.connect(clientId.c_str())) {
+      Serial.println("connected to MQTT");
+      // Once connected, publish an announcement...
+      mqttclient.publish("emon/nixie/connected", "1");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqttclient.state());
+    }
+  }
+}
+
+void readtemp(){   // Read the I2c temperature and humidity sensor
+
+  float t = sht31.readTemperature();
+  float h = sht31.readHumidity();
+
+  if (isnan(t) || isnan(h)) {  // check if 'is not a number'
+#ifdef DEBUG
+    Serial.println("Failed to read temperature/humidity");
+#endif
+    sht31.reset();
+  } else { 
+    temp = t;
+    humidity =h;
+    // Ensure we are connected to MQTT
+    if (!mqttclient.connected()) {
+      reconnect();
+    } else {
+      // mqtt needs values to be ascii text
+      char buffer [10];
+      dtostrf( temp,5,2,buffer);
+      mqttclient.publish("emon/nixie/temperature", buffer);
+      dtostrf( humidity,5,2,buffer);
+      mqttclient.publish("emon/nixie/humidity", buffer);
+    }
+  }
+}
 
 
